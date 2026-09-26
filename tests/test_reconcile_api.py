@@ -253,6 +253,38 @@ class ReconcileApiTests(unittest.TestCase):
         self.assertEqual(follow_up["follow"].status_code, 200)
         self.assertEqual(self.post_reconcile(SMALL).status_code, 200)
 
+    def test_worker_crash_fails_fast_503_and_recovers(self):
+        url = f"{self.base}/runs/reconcile"
+        results: dict[str, httpx.Response] = {}
+        slow_thread = threading.Thread(
+            target=_post_in_thread, args=(url, SLOW, results, "slow")
+        )
+        slow_thread.start()
+        time.sleep(0.5)  # 慢对账已进入执行
+        started = time.monotonic()
+        app.state.reconcile_worker._process.kill()  # 模拟计算中工作进程被终止
+        slow_thread.join(timeout=15)
+        # 执行中请求在退出被检测后快速返回 503，而不是等到任务超时
+        self.assertLess(time.monotonic() - started, 5)
+        resp = results["slow"]
+        self.assertEqual(resp.status_code, 503)
+        self.assertEqual(resp.json()["code"], "RECONCILE_WORKER_UNAVAILABLE")
+        # 重建就绪前新请求立即返回同一 503；重建成功后恢复正常对账（不自动重放）
+        deadline = time.monotonic() + 30
+        while True:
+            resp = self.post_reconcile(SMALL)
+            if resp.status_code == 200:
+                self.assertEqual(resp.json(), reconcile_runs(**SMALL))
+                break
+            self.assertEqual(resp.status_code, 503)
+            self.assertEqual(resp.json()["code"], "RECONCILE_WORKER_UNAVAILABLE")
+            self.assertLess(
+                time.monotonic(), deadline, "工作进程未在预期时间内自动重建"
+            )
+            time.sleep(0.2)
+        # 恢复后正常对账语义不受影响：后续请求继续成功
+        self.assertEqual(self.post_reconcile(SMALL).status_code, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

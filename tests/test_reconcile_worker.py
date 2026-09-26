@@ -1,7 +1,8 @@
 """app.reconcile_worker 的单元测试（仅依赖标准库，可直接 `python -m unittest discover`）。
 
 覆盖：成功结果与业务错误的搬运、满额拒收、排队 / 执行中超时的名额释放语义、
-取消语义、迟到结果丢弃、事件循环不被计算阻塞、随生命周期回收。
+取消语义、迟到结果丢弃、事件循环不被计算阻塞、随生命周期回收，
+以及工作进程异常退出后的快速失败、名额清理、自动重建与旧进程消息隔离。
 """
 
 from __future__ import annotations
@@ -11,7 +12,11 @@ import time
 import unittest
 
 from app.reconcile import reconcile_runs
-from app.reconcile_worker import ReconcileTimeout, ReconcileWorker
+from app.reconcile_worker import (
+    ReconcileTimeout,
+    ReconcileWorker,
+    ReconcileWorkerUnavailable,
+)
 
 
 def make_payload(n, tolerance=2):
@@ -66,6 +71,20 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
                 return future
             await asyncio.sleep(0.05)
         self.fail("等待名额释放超时")
+
+    async def submit_after_recovery(self, generation, payload=SMALL, tries=600):
+        """轮询直至崩溃后自动重建完成（代数已前进且 submit 不再拒绝）。"""
+        for _ in range(tries):
+            if self.worker._generation > generation:
+                try:
+                    future = self.worker.submit(payload, LONG_TIMEOUT)
+                except ReconcileWorkerUnavailable:
+                    await asyncio.sleep(0.05)
+                    continue
+                if future is not None:
+                    return future
+            await asyncio.sleep(0.05)
+        self.fail("工作进程未在预期时间内自动重建")
 
     async def test_success_result_matches_direct_call(self):
         future = self.worker.submit(SMALL, LONG_TIMEOUT)
@@ -164,6 +183,109 @@ class WorkerTests(unittest.IsolatedAsyncioTestCase):
         # 计算期间事件循环持续响应（若被阻塞，ticks 会远小于该值）
         self.assertGreaterEqual(ticks, 10)
         self.assertEqual((await self.wait_done(future))[0], "ok")
+
+    async def test_crash_fails_waiting_tasks_within_one_second(self):
+        f1 = self.worker.submit(SLOW, LONG_TIMEOUT)  # 执行中
+        f2 = self.worker.submit(SMALL, LONG_TIMEOUT)  # 排队
+        await asyncio.sleep(0.2)  # 确保 f1 已进入执行
+        self.worker._process.kill()  # 模拟计算中子进程被终止
+        started = time.monotonic()
+        with self.assertRaises(ReconcileWorkerUnavailable):
+            await asyncio.wait_for(asyncio.shield(f1), 5)
+        with self.assertRaises(ReconcileWorkerUnavailable):
+            await asyncio.wait_for(asyncio.shield(f2), 5)
+        # 退出被检测后 1 秒内，仍等待的执行中与排队任务都已失败（而非等到超时）
+        self.assertLess(time.monotonic() - started, 1.0)
+        # 该进程占用的全部名额与忙碌标记已清理
+        self.assertEqual(len(self.worker._tasks), 0)
+        self.assertEqual(len(self.worker._queue), 0)
+        self.assertFalse(self.worker._worker_busy)
+
+    async def test_crash_rejects_until_rebuilt_then_recovers_without_replay(self):
+        f1 = self.worker.submit(SLOW, LONG_TIMEOUT)
+        await asyncio.sleep(0.2)
+        generation = self.worker._generation
+        self.worker._process.kill()
+        with self.assertRaises(ReconcileWorkerUnavailable):
+            await asyncio.wait_for(asyncio.shield(f1), 5)
+        # 重建就绪前新任务立即被拒（不进入队列）
+        with self.assertRaises(ReconcileWorkerUnavailable):
+            self.worker.submit(SMALL, LONG_TIMEOUT)
+        # 自动重建完成后恢复正常对账
+        f2 = await self.submit_after_recovery(generation)
+        self.assertEqual((await self.wait_done(f2))[0], "ok")
+        f3 = self.worker.submit(SMALL, LONG_TIMEOUT)
+        self.assertIsNotNone(f3)
+        self.assertEqual((await self.wait_done(f3))[0], "ok")
+        # 受影响任务不自动重放：f1 保持失败，不会稍后变成成功
+        with self.assertRaises(ReconcileWorkerUnavailable):
+            await f1
+
+    async def test_crash_does_not_complete_timed_out_or_cancelled_again(self):
+        f1 = self.worker.submit(SLOW, timeout_sec=0.3)  # 执行中，很快超时
+        with self.assertRaises(ReconcileTimeout):
+            await asyncio.wait_for(asyncio.shield(f1), 5)
+        f2 = self.worker.submit(SMALL, LONG_TIMEOUT)  # 排队（f1 名额未释放）
+        f2.cancel()
+        self.worker.cancel(f2)  # 排队任务撤销
+        generation = self.worker._generation
+        self.worker._process.kill()
+        await asyncio.sleep(0.5)  # 等待崩溃检测与清理完成
+        # 已超时 / 已取消的 Future 保持原状，不被崩溃处理再次完成
+        with self.assertRaises(ReconcileTimeout):
+            await f1
+        self.assertTrue(f2.cancelled())
+        # 崩溃后自动重建，恢复服务
+        future = await self.submit_after_recovery(generation)
+        self.assertEqual((await self.wait_done(future))[0], "ok")
+
+    async def test_crash_while_idle_recovers(self):
+        future = self.worker.submit(SMALL, LONG_TIMEOUT)
+        self.assertEqual((await self.wait_done(future))[0], "ok")
+        generation = self.worker._generation
+        self.worker._process.kill()  # 空闲时被终止
+        recovered = await self.submit_after_recovery(generation)
+        self.assertEqual((await self.wait_done(recovered))[0], "ok")
+
+    async def test_stale_generation_messages_and_callbacks_are_ignored(self):
+        generation = self.worker._generation
+        self.worker._process.kill()
+        running = await self.submit_after_recovery(generation, SLOW)  # 新一代任务进入执行
+        stale = self.worker._generation - 1
+        self.assertGreaterEqual(stale, generation)
+        self.assertTrue(self.worker._worker_busy)
+        # 旧进程的迟到消息与退出回调：不释放名额、不触发派发、不再次失败任务
+        self.worker._on_message(stale, ("free",))
+        self.worker._on_message(stale, ("done", 1, ("ok", None)))
+        self.worker._on_worker_exit(stale)
+        self.assertTrue(self.worker._worker_busy)
+        self.assertEqual(len(self.worker._tasks), 1)
+        self.assertFalse(running.done())
+        # 新任务不受干扰，正常完成
+        self.assertEqual((await self.wait_done(running))[0], "ok")
+
+    async def test_stop_during_recovery_reclaims_process_and_threads(self):
+        future = self.worker.submit(SLOW, LONG_TIMEOUT)
+        await asyncio.sleep(0.2)
+        self.worker._process.kill()
+        await asyncio.sleep(0.2)  # 让崩溃处理触发（重建可能尚未就绪）
+        await self.worker.stop()
+        self.assertIsNone(self.worker._process)
+        self.assertIsNone(self.worker._pump_thread)
+        self.assertIsNone(self.worker._monitor_thread)
+        # 关闭时停止恢复：不会留下重建出的新进程
+        self.assertFalse(self.worker._started)
+        with self.assertRaises(ReconcileWorkerUnavailable):
+            await future  # 被终止的任务已失败，取回异常避免未检索告警
+        await self.worker.stop()  # 重复停止安全
+
+    async def test_stop_before_crash_callback_prevents_rebuild(self):
+        self.worker.submit(SMALL, LONG_TIMEOUT)
+        self.worker._process.kill()
+        await self.worker.stop()  # 立即关闭：随后到达的退出回调不应触发重建
+        await asyncio.sleep(0.3)
+        self.assertIsNone(self.worker._process)
+        self.assertFalse(self.worker._started)
 
     async def test_stop_waits_for_running_task(self):
         self.worker.submit(SLOW, LONG_TIMEOUT)

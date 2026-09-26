@@ -500,6 +500,12 @@ curl -s http://localhost:8000/schedule/rebalance \
   计时，**排队时间计入**；到期返回 `504` + `RECONCILE_TIMEOUT`。
 - 超时或客户端断开时：仍在排队的任务直接撤销并立即释放名额（不会被执行）；
   已在执行的任务无法打断，名额保留到其**实际结束**才释放，迟到的结果直接丢弃。
+- 工作进程**异常退出**（如计算中被终止）时，监控线程立即感知：仍等待的
+  执行中与排队请求在 **1 秒内**返回 `503` + `RECONCILE_WORKER_UNAVAILABLE`，
+  该进程占用的全部名额与计时器一并清理（已取消或已超时的请求不会再次被
+  完成）；随后**自动重建**单工作进程，重建就绪前新请求立即返回同一 `503`，
+  就绪后恢复正常对账。受影响任务**不自动重放**；旧进程的迟到消息与回调被
+  隔离，不会释放新任务名额或触发重复派发。
 
 ### 请求示例（正常对账）
 
@@ -592,6 +598,18 @@ curl -s http://localhost:8000/runs/reconcile \
   "code": "RECONCILE_BUSY",
   "message": "对账任务满额：未结束任务（执行中与排队中合计）已达上限，请稍后重试",
   "details": { "max_inflight": 2 }
+}
+```
+
+### 响应示例（工作进程不可用，503）
+
+工作进程异常退出后自动重建期间，仍等待的请求与重建就绪前的新请求都立即
+返回同一错误（任务未提交计算、不自动重放，重建成功后自动恢复）：
+
+```json
+{
+  "code": "RECONCILE_WORKER_UNAVAILABLE",
+  "message": "对账工作进程不可用：异常退出后正在自动重建，请稍后重试"
 }
 ```
 
@@ -1643,8 +1661,9 @@ curl -s http://localhost:8000/replays/plan \
 ```
 
 `POST /runs/reconcile` 的任务调度错误使用同样的响应体结构，但状态码不同：
-任务满额返回 `503` + `RECONCILE_BUSY`，任务超时返回 `504` + `RECONCILE_TIMEOUT`
-（见该接口的「执行模型」一节）。
+任务满额返回 `503` + `RECONCILE_BUSY`，工作进程异常退出后重建中返回
+`503` + `RECONCILE_WORKER_UNAVAILABLE`，任务超时返回 `504` +
+`RECONCILE_TIMEOUT`（见该接口的「执行模型」一节）。
 
 错误码：
 
@@ -1691,6 +1710,7 @@ curl -s http://localhost:8000/replays/plan \
 | `TOO_MANY_REPLAY_CANDIDATES` | 仅直接调用核心逻辑时：候选超过 12 条（HTTP 层由请求结构校验提前返回 `INVALID_REQUEST`） |
 | `RECONCILE_BUSY` | 仅 `POST /runs/reconcile`（HTTP `503`）：未结束任务（执行中与排队中合计）已达上限 2 个，请求未被接纳、不提交计算 |
 | `RECONCILE_TIMEOUT` | 仅 `POST /runs/reconcile`（HTTP `504`）：任务自接纳起超过 `RECONCILE_TIMEOUT_SECONDS`（默认 10 秒，含排队时间）仍未完成 |
+| `RECONCILE_WORKER_UNAVAILABLE` | 仅 `POST /runs/reconcile`（HTTP `503`）：工作进程异常退出后正在自动重建，仍等待的请求立即失败、重建就绪前的新请求立即被拒；任务不自动重放，重建成功后自动恢复 |
 
 > `POST /versions/merge` 的字段级分歧不是错误：无论是否合并成功都返回 HTTP `200`，
 > 由响应体的 `status`（`merged` / `diverged`）区分；仅版本内部重复 id
@@ -1726,6 +1746,10 @@ curl -s http://localhost:8000/replays/plan \
 - 超时（默认 10 秒，`RECONCILE_TIMEOUT_SECONDS` 可配，含排队时间）返回
   `504` + `RECONCILE_TIMEOUT`：排队任务撤销并立即释放名额，执行中任务须等
   实际结束才释放名额、迟到结果丢弃；客户端中途断开按同样规则处理。
+- 工作进程异常退出时：仍等待的执行中与排队请求在 1 秒内返回
+  `503` + `RECONCILE_WORKER_UNAVAILABLE`，该进程的全部名额与计时器被清理；
+  随后自动重建单工作进程，重建就绪前新请求立即返回同一 `503`，就绪后恢复
+  正常对账；受影响任务不自动重放。
 
 `POST /runs/calibrate` 额外约定：
 

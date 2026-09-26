@@ -19,7 +19,11 @@ from .interruptions import plan_interruption
 from .merge import merge_versions
 from .preload import plan_preload
 from .rebalance import rebalance_schedule
-from .reconcile_worker import ReconcileTimeout, ReconcileWorker
+from .reconcile_worker import (
+    ReconcileTimeout,
+    ReconcileWorker,
+    ReconcileWorkerUnavailable,
+)
 from .replays import plan_replays
 from .routing import assign_routing
 from .schemas import (
@@ -106,7 +110,10 @@ app = FastAPI(
         "再并列入选 id 升序列表字典序最小的集合；"
         "实播对账的计算在应用生命周期管理的专属单工作进程中串行执行，"
         "未结束任务（执行中与排队中合计）最多 2 个，单任务超时由 "
-        "RECONCILE_TIMEOUT_SECONDS 配置，长对账期间健康检查等接口照常响应。"
+        "RECONCILE_TIMEOUT_SECONDS 配置，长对账期间健康检查等接口照常响应；"
+        "工作进程异常退出时仍等待的请求立即收到 503 "
+        "（RECONCILE_WORKER_UNAVAILABLE），随后自动重建单工作进程，"
+        "重建就绪前新请求同样立即收到该 503，受影响任务不自动重放。"
     ),
     lifespan=lifespan,
 )
@@ -145,6 +152,17 @@ async def _wait_client_disconnect(request: Request) -> None:
         message = await request.receive()
         if message["type"] == "http.disconnect":
             return
+
+
+def _worker_unavailable_response() -> JSONResponse:
+    """工作进程异常退出后重建中的统一 503 响应（任务未提交计算、不自动重放）。"""
+    return JSONResponse(
+        status_code=503,
+        content={
+            "code": "RECONCILE_WORKER_UNAVAILABLE",
+            "message": "对账工作进程不可用：异常退出后正在自动重建，请稍后重试",
+        },
+    )
 
 
 @app.post(
@@ -194,7 +212,8 @@ async def rebalance(body: RebalanceRequest) -> dict:
         422: {"model": ErrorBody, "description": "请求非法或对账失败"},
         503: {
             "model": ErrorBody,
-            "description": "对账任务满额（执行中与排队中合计达到上限），未提交计算",
+            "description": "对账任务满额（RECONCILE_BUSY），或对账工作进程异常退出后"
+            "重建中（RECONCILE_WORKER_UNAVAILABLE）；均未提交计算",
         },
         504: {
             "model": ErrorBody,
@@ -213,7 +232,11 @@ async def reconcile(body: ReconcileRequest, request: Request) -> dict:
         "extra_penalty": body.extra_penalty,
     }
     worker: ReconcileWorker = app.state.reconcile_worker
-    future = worker.submit(payload, timeout_sec=_reconcile_timeout_seconds())
+    try:
+        future = worker.submit(payload, timeout_sec=_reconcile_timeout_seconds())
+    except ReconcileWorkerUnavailable:
+        # 工作进程异常退出后重建中：立即拒绝，不提交计算
+        return _worker_unavailable_response()
     if future is None:
         return JSONResponse(
             status_code=503,
@@ -254,6 +277,9 @@ async def reconcile(body: ReconcileRequest, request: Request) -> dict:
                 "details": {"timeout_seconds": _reconcile_timeout_seconds()},
             },
         )
+    except ReconcileWorkerUnavailable:
+        # 执行中 / 排队期间工作进程异常退出：任务未完成且不自动重放
+        return _worker_unavailable_response()
     if outcome[0] == "ok":
         return outcome[1]
     if outcome[0] == "error":

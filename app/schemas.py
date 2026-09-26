@@ -751,6 +751,7 @@ class ErrorBody(BaseModel):
         "TOO_MANY_REPLAY_CANDIDATES",
         "RECONCILE_BUSY",
         "RECONCILE_TIMEOUT",
+        "RECONCILE_WORKER_UNAVAILABLE",
     ]
     message: str
     details: dict | None = None
