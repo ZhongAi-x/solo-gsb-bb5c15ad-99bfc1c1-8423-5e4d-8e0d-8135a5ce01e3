@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import threading
 import time
@@ -251,6 +252,59 @@ class ReconcileApiTests(unittest.TestCase):
         slow_thread.join()
         follow_thread.join()
         self.assertEqual(follow_up["follow"].status_code, 200)
+        self.assertEqual(self.post_reconcile(SMALL).status_code, 200)
+
+    def _worker(self):
+        return app.state.reconcile_worker
+
+    def _kill_worker(self):
+        process = self._worker()._process
+        old_pid = process.pid
+        os.kill(process.pid, signal.SIGKILL)
+        return old_pid
+
+    def _wait_worker_rebuilt(self, old_pid, timeout=30):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            process = self._worker()._process
+            if self._worker().is_available and process is not None and process.pid != old_pid:
+                return
+            time.sleep(0.02)
+        raise AssertionError("等待对账工作进程重建就绪超时")
+
+    def test_worker_crash_returns_503_and_rebuilds(self):
+        url = f"{self.base}/runs/reconcile"
+        results: dict[str, httpx.Response] = {}
+        # 执行中 + 排队各一个，占满两名额
+        t1 = threading.Thread(target=_post_in_thread, args=(url, SLOW, results, "run"))
+        t2 = threading.Thread(target=_post_in_thread, args=(url, SLOW, results, "queued"))
+        t1.start()
+        time.sleep(0.3)
+        t2.start()
+        time.sleep(0.3)
+        old_pid = self._kill_worker()
+        t1.join(timeout=30)
+        t2.join(timeout=30)
+        for key in ("run", "queued"):
+            self.assertEqual(results[key].status_code, 503, key)
+            self.assertEqual(results[key].json()["code"], "RECONCILE_WORKER_UNAVAILABLE", key)
+        # 重建窗口内新请求立即同一 503（不排队）；重建成功后恢复正常
+        deadline = time.monotonic() + 30
+        saw_unavailable = False
+        while time.monotonic() < deadline:
+            resp = self.post_reconcile(SMALL)
+            if resp.status_code == 503:
+                self.assertEqual(resp.json()["code"], "RECONCILE_WORKER_UNAVAILABLE")
+                saw_unavailable = True
+                time.sleep(0.02)
+                continue
+            self.assertEqual(resp.status_code, 200)
+            break
+        else:
+            self.fail("工作进程重建后对账仍未恢复")
+        self._wait_worker_rebuilt(old_pid)
+        # 受影响任务不自动重放 / 无重复派发：重建后连续对账均正常
+        self.assertEqual(self.post_reconcile(SMALL).status_code, 200)
         self.assertEqual(self.post_reconcile(SMALL).status_code, 200)
 
 
